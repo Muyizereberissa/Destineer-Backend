@@ -1,117 +1,223 @@
-"""
-AI Engine Services
-Core logic for trending scores, hidden gems detection, and recommendations.
-No Celery required — can be run synchronously or as a management command.
-"""
+import json
+from google import genai
+from groq import Groq
+from django.conf import settings
 
-from datetime import timedelta
-from django.utils import timezone
-from django.db.models import Count, Avg
+# Configure Gemini (new way)
+gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+
+# Configure Groq
+groq_client = Groq(api_key=settings.GROQ_API_KEY)
 
 
-def update_trending_scores():
+def analyze_place_with_gemini(place_name, description):
     """
-    Score = (recent_views × 0.4) + (recent_ratings × 0.3) + (recent_comments × 0.2) + (recent_uploads × 0.1)
-    Window: last 7 days
+    Use Gemini to generate rich descriptions and tags for a place.
+    Called when a new place is added to the platform.
     """
-    from places.models import Place, PlaceStats
-    from .models import UserActivity
-
-    cutoff = timezone.now() - timedelta(days=7)
-    places = Place.objects.filter(is_published=True)
-
-    for place in places:
-        activities = UserActivity.objects.filter(place=place, timestamp__gte=cutoff)
-        views    = activities.filter(action='view').count()
-        ratings  = activities.filter(action='rate').count()
-        comments = activities.filter(action='comment').count()
-        uploads  = activities.filter(action='upload').count()
-
-        score = (views * 0.4) + (ratings * 0.3) + (comments * 0.2) + (uploads * 0.1)
-
-        PlaceStats.objects.update_or_create(
-            place=place,
-            defaults={'trending_score': round(score, 4)}
-        )
-
-    return f'Updated trending scores for {places.count()} places.'
-
-
-def flag_hidden_gems():
+    prompt = f"""
+    You are an expert Rwanda tourism guide called "Destineer AI".
+    
+    Analyze this tourist location:
+    Name: {place_name}
+    Description: {description}
+    
+    Return a JSON response with:
+    - enhanced_description: a vivid, engaging 2-sentence description
+    - tags: list of 5 relevant tags (e.g. "nature", "hidden gem", "family-friendly")
+    - best_time_to_visit: short recommendation
+    - vibe: one word (e.g. "adventurous", "peaceful", "cultural")
+    - hidden_gem_score: 1-10 (10 = very undiscovered)
+    
+    Only return valid JSON, no extra text.
     """
-    Hidden gem: avg_rating >= 4.0 AND total_ratings >= 2 AND total_views < 50
+
+    response = gemini_client.models.generate_content(
+        model='gemini-2.0-flash',
+        contents=prompt,
+    )
+    return response.text
+
+
+def analyze_uploaded_photo(image_path, place_name):
     """
-    from places.models import PlaceStats
+    Use Gemini Vision to read tourist photos and describe what it sees.
+    Called when a user uploads a photo of a place.
+    """
+    import PIL.Image
+    image = PIL.Image.open(image_path)
 
-    stats = PlaceStats.objects.all()
-    flagged = 0
+    prompt = f"""
+    This is a photo from {place_name} in Rwanda.
+    In 2 sentences, describe what you see in this image for a tourism platform.
+    Focus on what makes this place beautiful or interesting.
+    """
 
-    for s in stats:
-        is_gem = (s.avg_rating >= 4.0 and s.total_ratings >= 2 and s.total_views < 50)
-        if s.is_hidden_gem != is_gem:
-            s.is_hidden_gem = is_gem
-            s.save(update_fields=['is_hidden_gem'])
-            flagged += 1
+    response = gemini_client.models.generate_content(
+        model='gemini-2.0-flash',
+        contents=[prompt, image],
+    )
+    return response.text
 
-    return f'Flagged {flagged} hidden gems.'
+
+def get_travel_recommendations(user_interests, visited_places):
+    """
+    Use Groq for fast real-time recommendations.
+    Called for quick chat-based suggestions.
+    """
+    prompt = f"""
+    You are Destineer, a friendly AI travel guide for Rwanda.
+    
+    User interests: {user_interests}
+    Places they have already visited: {visited_places}
+    
+    Recommend 3 places in Rwanda they haven't seen yet.
+    Be specific, friendly, and enthusiastic.
+    Keep response under 150 words.
+    """
+
+    response = groq_client.chat.completions.create(
+        model="llama3-8b-8192",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=300,
+    )
+    return response.choices[0].message.content
 
 
 def generate_recommendations_for_user(user):
     """
-    Simple collaborative filtering:
-    1. Find places this user has NOT rated
-    2. Score each by avg_rating + trending_score
-    3. Boost if similar users (who rated same places) also liked it
-    Returns top 10 recommendations.
+    Generate and save personalized place recommendations for a user.
+    Called by RecommendationsView and RefreshRecommendationsView.
+    The AI receives real user data and decides everything itself.
     """
-    from places.models import Place, PlaceStats
-    from ratings.models import Rating
-    from .models import AIRecommendation
+    try:
+        from .models import UserActivity, AIRecommendation
+        from places.models import Place
 
-    # Places the user already interacted with
-    rated_place_ids = Rating.objects.filter(user=user).values_list('place_id', flat=True)
+        activity = UserActivity.objects.filter(user=user).select_related('place', 'place__category')
 
-    # Candidate places
-    candidates = (Place.objects
-                  .filter(is_published=True)
-                  .exclude(id__in=rated_place_ids)
-                  .select_related('stats'))
+        visited_places = [
+            {
+                "name": a.place.name,
+                "category": a.place.category.name if a.place.category else "unknown",
+                "action": a.action,
+            }
+            for a in activity if a.place
+        ]
 
-    scored = []
-    for place in candidates:
-        stats = getattr(place, 'stats', None)
-        if not stats:
-            continue
-        base_score = (stats.avg_rating / 5.0) * 0.6 + min(stats.trending_score / 100.0, 1.0) * 0.4
+        all_places = list(Place.objects.values('name', 'description'))
 
-        # Determine reason
-        if stats.is_hidden_gem:
-            reason = 'hidden_gem'
-            base_score += 0.1
-        elif stats.trending_score > 50:
-            reason = 'trending'
-        elif stats.avg_rating >= 4.5:
-            reason = 'top_rated'
-        else:
-            reason = 'similar_taste'
+        prompt = f"""
+        You are Destineer AI, a smart Rwanda tourism recommendation engine.
 
-        scored.append((base_score, place, reason))
+        This user's activity history:
+        {json.dumps(visited_places, indent=2)}
 
-    scored.sort(key=lambda x: x[0], reverse=True)
-    top10 = scored[:10]
+        All available places on the platform:
+        {json.dumps(all_places, indent=2)}
 
-    # Save recommendations
-    AIRecommendation.objects.filter(user=user).delete()
-    recs = []
-    for score, place, reason in top10:
-        recs.append(AIRecommendation(user=user, place=place, score=round(score, 4), reason=reason))
-    AIRecommendation.objects.bulk_create(recs)
+        Based on the user's interests and behavior patterns, recommend 3 places 
+        they have NOT interacted with yet that they would genuinely love.
+        
+        Think carefully about patterns in what they like before deciding.
 
-    return top10
+        Return ONLY a valid JSON array, nothing else:
+        [
+            {{"name": "exact place name from the list", "reason": "personalized one sentence reason"}},
+            {{"name": "exact place name from the list", "reason": "personalized one sentence reason"}},
+            {{"name": "exact place name from the list", "reason": "personalized one sentence reason"}}
+        ]
+        """
+
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+
+        raw = response.choices[0].message.content.strip()
+        recommendations = json.loads(raw)
+
+        AIRecommendation.objects.filter(user=user).delete()
+
+        for rec in recommendations:
+            place = Place.objects.filter(name__icontains=rec.get('name', '')).first()
+            if place:
+                AIRecommendation.objects.create(
+                    user=user,
+                    place=place,
+                    reason=rec.get('reason', ''),
+                    score=0.9,
+                )
+
+    except Exception as e:
+        print(f"[Destineer AI] generate_recommendations_for_user error: {e}")
 
 
 def run_all_ai_tasks():
-    """Run all AI computations in sequence. Call this from a cron or management command."""
-    r1 = update_trending_scores()
-    r2 = flag_hidden_gems()
-    return {'trending': r1, 'hidden_gems': r2}
+    """
+    Run all background AI tasks.
+    The AI receives real platform data and decides everything:
+    - Which places are hidden gems
+    - Which places are trending
+    - Which places are top rated
+    Called by RunAITasksView (admin only).
+    """
+    results = {}
+
+    try:
+        from places.models import Place
+
+        places = Place.objects.select_related('stats').all()
+        places_data = [
+            {
+                "name": place.name,
+                "description": place.description,
+                "visit_count": place.stats.view_count if hasattr(place, 'stats') and place.stats else 0,
+                "avg_rating": float(place.stats.average_rating) if hasattr(place, 'stats') and place.stats else 0.0,
+                "total_ratings": place.stats.rating_count if hasattr(place, 'stats') and place.stats else 0,
+            }
+            for place in places
+        ]
+
+        prompt = f"""
+        You are Destineer AI, analyzing Rwanda tourism data for a platform.
+
+        Here is real data for all places on the platform:
+        {json.dumps(places_data, indent=2)}
+
+        Analyze this data intelligently and return a JSON object with:
+        {{
+            "hidden_gems": ["place names that have high ratings but very few visitors"],
+            "trending": ["place names that are getting the most visits recently"],
+            "top_rated": ["place names with the highest average ratings"]
+        }}
+
+        Use your judgment to decide what qualifies as a hidden gem vs trending.
+        Only return the JSON object, nothing else.
+        """
+
+        response = groq_client.chat.completions.create(
+            model="llama3-8b-8192",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+        )
+
+        raw = response.choices[0].message.content.strip()
+        ai_analysis = json.loads(raw)
+
+        Place.objects.all().update(is_hidden_gem=False)
+        for name in ai_analysis.get('hidden_gems', []):
+            Place.objects.filter(name__icontains=name).update(is_hidden_gem=True)
+
+        results['hidden_gems'] = ai_analysis.get('hidden_gems', [])
+        results['trending'] = ai_analysis.get('trending', [])
+        results['top_rated'] = ai_analysis.get('top_rated', [])
+        results['status'] = 'completed'
+
+    except Exception as e:
+        results['status'] = 'error'
+        results['error'] = str(e)
+        print(f"[Destineer AI] run_all_ai_tasks error: {e}")
+
+    return results

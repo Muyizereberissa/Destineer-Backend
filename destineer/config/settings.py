@@ -167,3 +167,6 @@ SPECTACULAR_SETTINGS = {
     'DESCRIPTION': 'Community-driven travel guide for Rwanda destinations',
     'VERSION': '1.0.0',
 }
+
+GEMINI_API_KEY = config('GEMINI_API_KEY', default='')
+GROQ_API_KEY = config('GROQ_API_KEY', default='')
